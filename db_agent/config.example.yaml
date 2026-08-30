@@ -1,0 +1,53 @@
+# db_validator 설정 예시
+# 실제 사용시 config.yaml 로 복사 후 수정하고, 민감정보는 .env 에 넣으세요.
+
+databases:
+  source:
+    type: oracle          # oracle | postgresql | mysql | mssql | sqlite
+    host: ${ORACLE_HOST}
+    port: 1521
+    user: ${ORACLE_USER}
+    password: ${ORACLE_PASSWORD}
+    service_name: ${ORACLE_SERVICE}
+
+  target:
+    type: postgresql
+    host: ${PG_HOST}
+    port: 5432
+    user: ${PG_USER}
+    password: ${PG_PASSWORD}
+    database: ${PG_DATABASE}
+
+# 소스 테이블명 -> 타겟 테이블명 매핑 (이름이 같아도 명시 필요)
+table_map:
+  MEMBERS: members
+  RESERVATIONS: reservations
+  ATTENDANCE: attendance
+
+# checksum 비교시 정렬 기준이 될 PK 컬럼 (없으면 checksum 검증은 스킵됨)
+key_columns:
+  MEMBERS: [member_id]
+  RESERVATIONS: [reservation_id]
+  ATTENDANCE: [attendance_id]
+
+# 체크섬/샘플 비교시 최대 조회 행 수
+sample_size: 1000
+
+# true로 두면 타입 길이/정밀도까지 비교 (VARCHAR2(4000) -> VARCHAR(10) 축소 탐지)
+# CLI의 --strict-types 로도 켤 수 있습니다.
+strict_types: false
+
+# 마이그레이션 전/후 동일 의미의 쿼리를 직접 비교하고 싶을 때 사용
+# target_sql을 생략하면 source_sql을 타겟에도 동일하게 실행함 (방언 차이 없을 때)
+query_pairs:
+  - name: "활성 회원 수"
+    source_sql: "SELECT COUNT(*) FROM MEMBERS WHERE STATUS = 'ACTIVE'"
+    target_sql: "SELECT COUNT(*) FROM members WHERE status = 'active'"
+
+  - name: "이번달 예약 건수"
+    source_sql: >
+      SELECT COUNT(*) FROM RESERVATIONS
+      WHERE RESERVED_AT >= TRUNC(SYSDATE, 'MM')
+    target_sql: >
+      SELECT COUNT(*) FROM reservations
+      WHERE reserved_at >= date_trunc('month', now())

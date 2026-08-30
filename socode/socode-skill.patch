@@ -1,0 +1,553 @@
+From 0e87747c90d5084b3e0fa932a38e7fc20916f581 Mon Sep 17 00:00:00 2001
+From: ohjunseon <ohjunseon@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 02:40:07 +0000
+Subject: [PATCH] =?UTF-8?q?Add=20socode:=20=EC=86=8C=EC=8A=A4=EB=B3=B4?=
+ =?UTF-8?q?=EC=95=88=20=EC=B7=A8=EC=95=BD=EC=A0=90=20=EC=9E=90=EB=8F=99?=
+ =?UTF-8?q?=EC=88=98=EC=A0=95=20=EC=BD=94=ED=8C=8C=EC=9D=BC=EB=9F=BF=20?=
+ =?UTF-8?q?=EC=8A=A4=ED=82=AC?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+사내 SAST CLI 실행 → 결과 정규화 → Critical/High 자동수정 → 테스트 검증 → PR 생성 파이프라인.
+
+- SKILL.md: 전체 워크플로우 및 심각도별 처리 정책
+- scripts/run_scan.sh: 사내 CLI wrapper (SECURITY_CLI 환경변수로 설정)
+- scripts/parse_results.py: raw 출력 → 표준 findings 스키마 변환
+- scripts/run_tests.sh: Maven/Gradle/npm/pytest 자동 감지 회귀 테스트
+- scripts/create_pr.sh: 지정 파일만 커밋 후 PR 생성
+- references/vuln_patterns.md: 취약점 유형별 표준 수정 패턴
+---
+ socode/SKILL.md                    | 132 +++++++++++++++++++++++++++++
+ socode/references/vuln_patterns.md |  49 +++++++++++
+ socode/scripts/create_pr.sh        |  95 +++++++++++++++++++++
+ socode/scripts/parse_results.py    | 126 +++++++++++++++++++++++++++
+ socode/scripts/run_scan.sh         |  54 ++++++++++++
+ socode/scripts/run_tests.sh        |  24 ++++++
+ 6 files changed, 480 insertions(+)
+ create mode 100644 socode/SKILL.md
+ create mode 100644 socode/references/vuln_patterns.md
+ create mode 100755 socode/scripts/create_pr.sh
+ create mode 100755 socode/scripts/parse_results.py
+ create mode 100755 socode/scripts/run_scan.sh
+ create mode 100755 socode/scripts/run_tests.sh
+
+diff --git a/socode/SKILL.md b/socode/SKILL.md
+new file mode 100644
+index 0000000..6796cd7
+--- /dev/null
++++ b/socode/SKILL.md
+@@ -0,0 +1,132 @@
++---
++name: security-fix-copilot
++description: 사내 소스코드 취약점 진단 CLI 툴을 실행하고, 결과를 분석해 Critical/High 취약점은 자동으로 코드를 수정한 뒤 PR을 생성하는 보안 코파일럿 스킬. "보안 스캔", "취약점 점검", "시큐어코딩 점검", "소스보안 진단", 사내 보안툴 이름 언급, "취약점 자동수정", "보안 PR 만들어줘" 등의 요청이 있을 때 반드시 사용할 것. 코드 리뷰나 커밋 전 보안 점검이 필요한 상황에도 적극적으로 이 스킬을 제안할 것.
++---
++
++# 소스보안 자동수정 코파일럿
++
++사내 정적분석(SAST) CLI의 출력을 표준 스키마로 정규화한 뒤, Claude가 직접 코드를 읽고 수정하고, 테스트 검증 후 PR까지 생성한다.
++
++## 전체 흐름
++
++```
++1. run_scan.sh       : 사내 CLI 실행 → raw 결과 저장
++2. parse_results.py  : raw 출력 → 표준 JSON (findings.json)
++3. (Claude 직접)     : 분석 & 코드 수정
++4. run_tests.sh      : 회귀 테스트 통과 확인
++5. (Claude 직접)     : PR 본문 작성 (pr_body.md)
++6. create_pr.sh      : 브랜치 → 커밋 → PR
++```
++
++---
++
++## Step 1. 스캔 실행
++
++```bash
++bash scripts/run_scan.sh <target_path> > raw_scan_output.txt
++```
++
++사내 CLI는 두 방법 중 하나로 지정한다:
++
++```bash
++export SECURITY_CLI="사내툴명"
++export SECURITY_CLI_ARGS="scan --path {TARGET} --format json"   # {TARGET}이 경로로 치환됨
++```
++
++또는 `run_scan.sh` 안의 `DEFAULT_CLI` / `DEFAULT_ARGS`를 직접 수정한다.
++
++`exit code 1`은 "취약점 발견"으로 간주해 정상 처리하고, 2 이상만 실패로 본다. 사내 CLI의 exit code 규약이 다르면 이 임계값을 조정할 것.
++
++## Step 2. 결과 정규화
++
++```bash
++python3 scripts/parse_results.py raw_scan_output.txt > findings.json
++```
++
++표준 스키마:
++
++```json
++{
++  "id": "F-0001",
++  "file": "src/main/java/com/example/UserDao.java",
++  "line": 42,
++  "severity": "critical | high | medium | low",
++  "rule_id": "SQL_INJECTION",
++  "message": "사용자 입력이 SQL 쿼리에 직접 연결됨",
++  "cwe": "CWE-89"
++}
++```
++
++**현재 파서는 플레이스홀더다.** 실제 CLI 출력 샘플을 확보하면 `parse_raw_output()` 함수 내부와 `SEVERITY_MAP`만 교체하면 되고, 이후 단계는 표준 스키마에만 의존하므로 영향받지 않는다.
++
++파서 실행 시 **stderr 경고를 반드시 확인할 것**:
++- `파싱된 항목이 없습니다` → 정규식이 CLI 출력 형식과 불일치
++- `SEVERITY_MAP에 없는 심각도` → 미매핑 심각도가 medium으로 격하된 상태. 실제 critical이 자동수정 대상에서 누락될 수 있으므로 **반드시 매핑을 먼저 추가한 뒤 재실행**한다.
++
++## Step 3. 분석 및 수정 (Claude가 직접 수행)
++
++`findings.json`을 읽고 심각도 정책에 따라 처리한다.
++
++| 심각도 | 처리 |
++|---|---|
++| critical, high | 코드 직접 수정 → 커밋 대상 |
++| medium | 리포트에만 포함, 수정 제안 텍스트 작성 |
++| low | 리포트에만 포함 |
++
++수정 시 반드시:
++
++1. `view`로 문제 라인 주변(최소 앞뒤 20줄) 컨텍스트를 확인한다. findings의 라인 번호만 믿고 바로 고치지 않는다 — 정적분석 도구는 라인이 어긋나거나 오탐이 나는 경우가 흔하다.
++2. `references/vuln_patterns.md`에서 해당 `rule_id`/CWE의 표준 수정 패턴을 확인한다.
++3. **오탐이라고 판단되면 수정하지 않는다.** 판단 근거를 기록해 리포트의 오탐 섹션에 넣는다.
++4. 비즈니스 로직 변경이 필요하거나 방향이 모호하면 자동수정하지 않고 `manual_review_needed`로 분류한다.
++5. 한 취약점당 최소 diff로 수정한다. 관련 없는 리팩토링·포맷팅 변경을 섞지 않는다.
++6. **수정한 파일 경로 목록을 반드시 기록해 둔다.** Step 6에서 커밋 대상으로 명시해야 한다.
++
++## Step 4. 테스트 검증
++
++```bash
++bash scripts/run_tests.sh
++```
++
++실패하면 해당 수정을 되돌리고 `manual_review_needed`로 전환한다. **테스트 통과 없이는 PR을 만들지 않는다.**
++
++테스트 러너를 자동 판별하지 못하면 스크립트가 실패하므로, 프로젝트 전용 커맨드를 `run_tests.sh`에 추가한다.
++
++## Step 5. PR 본문 작성
++
++`pr_body.md` 파일을 직접 작성한다. 반드시 포함할 항목:
++
++- 수정된 취약점 목록 (rule_id, CWE, `파일:라인`, 한 줄 수정 요약)
++- 회귀 테스트 통과 여부
++- 오탐으로 판단해 수정하지 않은 항목과 그 근거
++- `manual_review_needed` 항목 (별도 이슈 등록 권장 문구 포함)
++- 자동수정 대상이 아닌 medium/low 항목 요약
++
++**하드코딩된 credential 관련 수정은 실제 값을 PR 본문이나 커밋 메시지에 절대 남기지 않는다.**
++
++## Step 6. PR 생성
++
++```bash
++bash scripts/create_pr.sh <branch_name> <pr_title> pr_body.md <수정파일1> [수정파일2 ...]
++```
++
++수정한 파일을 **모두 명시적으로 나열**해야 한다. 이 스크립트는 `git add -A`를 쓰지 않으므로 작업 트리의 무관한 변경이 섞이지 않는다.
++
++PR 대상 브랜치를 지정하려면:
++
++```bash
++BASE_BRANCH=develop bash scripts/create_pr.sh ...
++```
++
++GitHub `gh` CLI 기준이다. GitLab이면 스크립트 하단의 `gh pr create`를 `glab mr create`로 교체한다.
++
++push나 PR 생성이 실패해도 **커밋된 브랜치는 삭제되지 않으므로** 수정 내용은 보존된다. 이 경우 push만 수동으로 진행하면 된다.
++
++---
++
++## 안전 원칙
++
++- **한 번에 3~5개씩** 수정하고 사용자 확인을 받는다. 대량 파일을 한꺼번에 고치라는 요청이어도 시범 실행부터 제안한다.
++- 자동수정은 되돌리기 쉬운 변경(파라미터 바인딩 교체, 이스케이핑 추가, 입력 검증 추가)에 한정한다. 아키텍처 변경이 필요한 취약점은 자동수정하지 않는다.
++- `references/vuln_patterns.md`에 없는 유형은 수정 전에 사용자에게 방향을 확인한다.
++- 정적분석 결과를 무비판적으로 신뢰하지 않는다. 오탐 가능성을 항상 검토하고, 판단이 서지 않으면 사용자에게 묻는다.
+diff --git a/socode/references/vuln_patterns.md b/socode/references/vuln_patterns.md
+new file mode 100644
+index 0000000..f8cfaea
+--- /dev/null
++++ b/socode/references/vuln_patterns.md
+@@ -0,0 +1,49 @@
++# 취약점 유형별 표준 수정 패턴
++
++Claude가 findings.json의 `rule_id`/`cwe`를 보고 참고할 표준 수정 패턴 모음.
++사내 CLI의 rule_id 명명 규칙을 알게 되면 아래 표의 매칭 키워드를 조정하세요.
++
++## SQL Injection (CWE-89)
++- **매칭 키워드**: SQL_INJECTION, SQLI
++- **수정 방향**: 문자열 연결(`+`, format, f-string)로 만든 쿼리를 파라미터 바인딩(PreparedStatement, MyBatis `#{}`, JPA named parameter 등)으로 교체
++- **주의**: MyBatis에서 `${}`(치환)를 `#{}`(바인딩)로 바꿀 때, 컬럼/테이블명 동적 지정처럼 바인딩이 불가능한 경우는 화이트리스트 검증으로 대체하고 자동수정 대상에서 제외
++
++## XSS (CWE-79)
++- **매칭 키워드**: XSS, CROSS_SITE_SCRIPTING
++- **수정 방향**: 사용자 입력을 HTML에 그대로 출력하는 부분에 이스케이핑 적용 (JSP `<c:out>`, Thymeleaf `th:text`, 프론트엔드는 프레임워크의 기본 이스케이핑 활용)
++- **주의**: `innerHTML`, `v-html`, `dangerouslySetInnerHTML` 등 명시적 raw HTML 삽입은 정말 필요한 경우인지 확인 후 sanitize 라이브러리 적용
++
++## Path Traversal (CWE-22)
++- **매칭 키워드**: PATH_TRAVERSAL, DIRECTORY_TRAVERSAL
++- **수정 방향**: 사용자 입력 경로를 `File.getCanonicalPath()` 등으로 정규화 후, 허용된 base 디렉토리 하위인지 검증
++
++## Hardcoded Credentials (CWE-798)
++- **매칭 키워드**: HARDCODED_PASSWORD, HARDCODED_SECRET, HARDCODED_CREDENTIALS
++- **수정 방향**: 환경변수 또는 사내 secret manager 참조로 교체. **자동수정 시 실제 값은 절대 커밋 로그/PR 본문에 남기지 않는다.**
++- **주의**: 이 유형은 credential 순환(rotation)이 필요할 수 있어 medium 이상이어도 사람 확인 권장
++
++## Insecure Deserialization (CWE-502)
++- **매칭 키워드**: DESERIALIZATION, UNSAFE_DESERIALIZE
++- **수정 방향**: 신뢰할 수 없는 입력의 역직렬화는 허용 클래스 화이트리스트 적용 (Java: `ObjectInputFilter`, Jackson: `PolymorphicTypeValidator`)
++- **주의**: 구조 변경이 커서 자동수정보다는 `manual_review_needed` 권장
++
++## Weak Cryptography (CWE-327)
++- **매칭 키워드**: WEAK_CRYPTO, WEAK_HASH, MD5, SHA1
++- **수정 방향**: MD5/SHA1 등 취약 해시를 SHA-256 이상으로 교체. 비밀번호 저장용이면 반드시 bcrypt/scrypt/Argon2 계열로 교체 (단순 해시 교체 아님)
++
++## Unvalidated Redirect (CWE-601)
++- **매칭 키워드**: OPEN_REDIRECT
++- **수정 방향**: 리다이렉트 대상 URL을 화이트리스트/상대경로로 제한
++
++## Missing Input Validation (CWE-20)
++- **매칭 키워드**: INPUT_VALIDATION, MISSING_VALIDATION
++- **수정 방향**: 룰이 포괄적이라 케이스별 판단 필요. 구체적인 하위 취약점(SQLi, XSS 등)으로 다시 분류 가능하면 위 항목 참고, 아니면 자동수정하지 않고 리포트만
++
++---
++
++## 새로운 rule_id를 만났을 때
++
++위 표에 없는 `rule_id`나 `cwe`를 만나면:
++1. CWE 번호로 웹 검색해서 표준 대응 패턴 확인
++2. 수정 방향이 명확하고 되돌리기 쉬운 변경이면 자동수정 진행
++3. 애매하면 `manual_review_needed`로 표시하고 이 파일에 새 항목 추가 제안
+diff --git a/socode/scripts/create_pr.sh b/socode/scripts/create_pr.sh
+new file mode 100755
+index 0000000..1aad3ca
+--- /dev/null
++++ b/socode/scripts/create_pr.sh
+@@ -0,0 +1,95 @@
++#!/usr/bin/env bash
++# 브랜치 생성 -> 지정된 파일만 커밋 -> PR 생성
++#
++# 사용법:
++#   bash create_pr.sh <branch_name> <pr_title> <pr_body_file> <file1> [file2 ...]
++#
++# 전제조건:
++#   - git 저장소 내부에서 실행
++#   - gh (GitHub CLI) 로그인 완료 상태
++#   - GitLab/Bitbucket/사내 Git이면 아래 gh 부분을 해당 CLI로 교체 (예: glab mr create)
++#
++# 환경변수:
++#   BASE_BRANCH  : PR 대상 브랜치 (기본값: 현재 브랜치)
++set -euo pipefail
++
++BRANCH_NAME="${1:?사용법: create_pr.sh <branch_name> <pr_title> <pr_body_file> <file1> [file2 ...]}"
++PR_TITLE="${2:?PR 제목이 필요합니다}"
++PR_BODY_FILE="${3:?PR 본문 파일 경로가 필요합니다}"
++shift 3
++
++if [ "$#" -eq 0 ]; then
++    echo "[create_pr.sh][ERROR] 커밋할 파일을 최소 1개 지정해야 합니다." >&2
++    echo "[create_pr.sh][ERROR] 무관한 변경이 섞이지 않도록 수정한 파일만 명시하세요." >&2
++    exit 1
++fi
++
++CHANGED_FILES=("$@")
++
++if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
++    echo "[create_pr.sh][ERROR] git 저장소 내부에서 실행해야 합니다." >&2
++    exit 1
++fi
++
++if [ ! -f "$PR_BODY_FILE" ]; then
++    echo "[create_pr.sh][ERROR] PR 본문 파일을 찾을 수 없습니다: $PR_BODY_FILE" >&2
++    exit 1
++fi
++
++ORIGINAL_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
++BASE_BRANCH="${BASE_BRANCH:-$ORIGINAL_BRANCH}"
++
++# 커밋 완료 여부. 커밋 후 실패했다면 브랜치를 절대 삭제하지 않는다(작업 유실 방지).
++COMMITTED=0
++
++cleanup_on_error() {
++    if [ "$COMMITTED" -eq 1 ]; then
++        echo "[create_pr.sh][ERROR] 실패했지만 커밋은 완료되었습니다." >&2
++        echo "[create_pr.sh][ERROR] 수정 내용은 브랜치 '$BRANCH_NAME'에 보존되어 있습니다." >&2
++        echo "[create_pr.sh][ERROR] push/PR만 수동으로 진행하세요. (git checkout $BRANCH_NAME)" >&2
++    else
++        echo "[create_pr.sh][ERROR] 실패했습니다. 원래 브랜치($ORIGINAL_BRANCH)로 복귀합니다." >&2
++        git checkout "$ORIGINAL_BRANCH" >/dev/null 2>&1 || true
++        git branch -D "$BRANCH_NAME" >/dev/null 2>&1 || true
++    fi
++}
++trap cleanup_on_error ERR
++
++# 지정된 파일이 실제로 변경되었는지 확인
++if git diff --quiet -- "${CHANGED_FILES[@]}" && \
++   git diff --cached --quiet -- "${CHANGED_FILES[@]}"; then
++    echo "[create_pr.sh][ERROR] 지정된 파일에 변경사항이 없습니다. PR을 만들지 않습니다." >&2
++    trap - ERR
++    exit 1
++fi
++
++echo "[create_pr.sh] 기준 브랜치: $BASE_BRANCH" >&2
++echo "[create_pr.sh] 브랜치 생성: $BRANCH_NAME" >&2
++git checkout -b "$BRANCH_NAME"
++
++# 지정된 파일만 스테이징 (git add -A 금지: 무관한 변경 혼입 방지)
++git add -- "${CHANGED_FILES[@]}"
++
++echo "[create_pr.sh] 커밋 대상 파일:" >&2
++git diff --cached --name-only >&2
++
++git commit -m "$PR_TITLE"
++COMMITTED=1
++
++git push -u origin "$BRANCH_NAME"
++
++trap - ERR
++
++if command -v gh >/dev/null 2>&1; then
++    gh pr create \
++        --base "$BASE_BRANCH" \
++        --head "$BRANCH_NAME" \
++        --title "$PR_TITLE" \
++        --body-file "$PR_BODY_FILE"
++else
++    echo "[create_pr.sh][WARN] gh CLI가 없습니다. 브랜치는 push되었으니 수동으로 PR을 생성하세요." >&2
++    echo "[create_pr.sh][WARN] GitLab이면: glab mr create --source-branch $BRANCH_NAME --target-branch $BASE_BRANCH" >&2
++fi
++
++git checkout "$ORIGINAL_BRANCH" >/dev/null 2>&1 || true
++echo "[create_pr.sh] 완료. 원래 브랜치($ORIGINAL_BRANCH)로 복귀했습니다." >&2
+diff --git a/socode/scripts/parse_results.py b/socode/scripts/parse_results.py
+new file mode 100755
+index 0000000..be6b377
+--- /dev/null
++++ b/socode/scripts/parse_results.py
+@@ -0,0 +1,126 @@
++#!/usr/bin/env python3
++"""
++사내 소스보안 CLI의 raw 출력을 표준 findings 스키마(JSON)로 변환한다.
++
++사용법:
++    python3 parse_results.py raw_scan_output.txt > findings.json
++
++표준 스키마:
++[
++  {
++    "id": "F-0001",
++    "file": "src/main/java/com/example/UserDao.java",
++    "line": 42,
++    "severity": "critical | high | medium | low",
++    "rule_id": "SQL_INJECTION",
++    "message": "...",
++    "cwe": "CWE-89"   # 없으면 null
++  },
++  ...
++]
++
++*** 이 파일은 플레이스홀더입니다 ***
++사내 CLI의 실제 출력 샘플을 받으면 parse_raw_output() 함수 내부 로직만
++교체하면 됩니다. 나머지 파이프라인(수정/PR생성)은 이 표준 스키마에만
++의존하므로 다른 곳은 건드릴 필요 없습니다.
++"""
++
++import sys
++import json
++import re
++
++
++# 사내 CLI의 심각도 표기 -> 표준 심각도 매핑
++# 예: {"상": "critical", "중": "high", "하": "medium", "정보": "low"}
++# 예: {"P1": "critical", "P2": "high", "P3": "medium", "P4": "low"}
++SEVERITY_MAP = {
++    "critical": "critical",
++    "high": "high",
++    "medium": "medium",
++    "low": "low",
++    # TODO: 사내 CLI 표기에 맞게 추가/수정
++}
++
++
++_unmapped_severities: set[str] = set()
++
++
++def normalize_severity(raw_severity: str) -> str:
++    """
++    매핑되지 않은 심각도는 medium으로 처리하되, 반드시 경고를 남긴다.
++    조용히 격하되면 실제 critical 취약점이 자동수정 대상에서 빠지므로 위험하다.
++    """
++    key = raw_severity.strip().lower()
++    if key not in SEVERITY_MAP:
++        _unmapped_severities.add(raw_severity.strip())
++        return "medium"
++    return SEVERITY_MAP[key]
++
++
++def parse_raw_output(raw_text: str) -> list[dict]:
++    """
++    TODO: 이 함수를 사내 CLI 출력 형식에 맞게 구현하세요.
++
++    아래는 아주 일반적인 형태 (플레이스홀더 예시):
++        [SEVERITY] file:line - RULE_ID - message
++
++    실제 CLI 출력이 JSON이면 json.loads()로 바로 파싱해서
++    필드명만 매핑하는 게 훨씬 간단합니다. 아래는 텍스트 파싱 예시.
++    """
++    findings = []
++    # file은 non-greedy + ':<숫자>' 앞까지로 잡아 Windows 경로(C:\...)도 안전하게 처리
++    pattern = re.compile(
++        r"\[(?P<severity>[^\]]+)\]\s+(?P<file>.+?):(?P<line>\d+)\s*-\s*"
++        r"(?P<rule_id>\S+)\s*-\s*(?P<message>.+)"
++    )
++
++    for line in raw_text.splitlines():
++        m = pattern.search(line)
++        if not m:
++            continue
++        findings.append(
++            {
++                "id": f"F-{len(findings) + 1:04d}",
++                "file": m.group("file").strip(),
++                "line": int(m.group("line")),
++                "severity": normalize_severity(m.group("severity")),
++                "rule_id": m.group("rule_id").strip(),
++                "message": m.group("message").strip(),
++                "cwe": None,  # TODO: CLI가 CWE를 제공하면 추출해서 채우기
++            }
++        )
++
++    if not findings:
++        print(
++            "[parse_results.py][WARN] 파싱된 항목이 없습니다. "
++            "parse_raw_output()이 사내 CLI 출력 형식과 맞는지 확인하세요.",
++            file=sys.stderr,
++        )
++
++    return findings
++
++
++def main():
++    if len(sys.argv) != 2:
++        print("사용법: python3 parse_results.py <raw_output_file>", file=sys.stderr)
++        sys.exit(1)
++
++    with open(sys.argv[1], "r", encoding="utf-8") as f:
++        raw_text = f.read()
++
++    findings = parse_raw_output(raw_text)
++
++    if _unmapped_severities:
++        print(
++            "[parse_results.py][WARN] SEVERITY_MAP에 없는 심각도 표기가 발견되어 "
++            f"medium으로 처리했습니다: {sorted(_unmapped_severities)}\n"
++            "[parse_results.py][WARN] 실제 critical/high가 자동수정 대상에서 누락될 수 "
++            "있으니 SEVERITY_MAP에 매핑을 추가하세요.",
++            file=sys.stderr,
++        )
++
++    print(json.dumps(findings, ensure_ascii=False, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/socode/scripts/run_scan.sh b/socode/scripts/run_scan.sh
+new file mode 100755
+index 0000000..7cd1f37
+--- /dev/null
++++ b/socode/scripts/run_scan.sh
+@@ -0,0 +1,54 @@
++#!/usr/bin/env bash
++# 사내 소스보안 CLI 실행 wrapper
++#
++# 사용법:
++#   bash run_scan.sh <target_path> > raw_scan_output.txt
++#
++# 설정 방법 (둘 중 하나):
++#   1) 환경변수로 지정 — 스크립트 수정 없이 사용 가능
++#        export SECURITY_CLI="secutool"
++#        export SECURITY_CLI_ARGS="scan --path {TARGET} --format json"
++#        ({TARGET} 자리에 대상 경로가 치환됩니다)
++#   2) 아래 기본값(DEFAULT_*)을 사내 CLI에 맞게 직접 수정
++set -euo pipefail
++
++TARGET_PATH="${1:?사용법: run_scan.sh <target_path>}"
++
++if [ ! -e "$TARGET_PATH" ]; then
++    echo "[run_scan.sh][ERROR] 대상 경로가 존재하지 않습니다: $TARGET_PATH" >&2
++    exit 1
++fi
++
++# ==== TODO: 사내 CLI에 맞게 수정 ====
++DEFAULT_CLI="secutool"
++DEFAULT_ARGS="scan --path {TARGET}"
++
++SECURITY_CLI="${SECURITY_CLI:-$DEFAULT_CLI}"
++SECURITY_CLI_ARGS="${SECURITY_CLI_ARGS:-$DEFAULT_ARGS}"
++
++if ! command -v "$SECURITY_CLI" >/dev/null 2>&1; then
++    echo "[run_scan.sh][ERROR] 보안 CLI를 찾을 수 없습니다: $SECURITY_CLI" >&2
++    echo "[run_scan.sh][ERROR] SECURITY_CLI / SECURITY_CLI_ARGS 환경변수를 설정하거나," >&2
++    echo "[run_scan.sh][ERROR] 이 스크립트의 DEFAULT_CLI / DEFAULT_ARGS를 수정하세요." >&2
++    exit 1
++fi
++
++# {TARGET} 치환 후 인자 배열로 변환
++RESOLVED_ARGS="${SECURITY_CLI_ARGS//\{TARGET\}/$TARGET_PATH}"
++read -r -a ARG_ARRAY <<< "$RESOLVED_ARGS"
++
++echo "[run_scan.sh] 실행: $SECURITY_CLI ${ARG_ARRAY[*]}" >&2
++
++# CLI가 취약점 발견 시 non-zero exit code를 반환하는 경우가 많으므로
++# set -e에 걸려 중단되지 않도록 exit code를 별도 처리한다.
++set +e
++"$SECURITY_CLI" "${ARG_ARRAY[@]}"
++SCAN_EXIT=$?
++set -e
++
++if [ "$SCAN_EXIT" -gt 1 ]; then
++    echo "[run_scan.sh][ERROR] 스캔이 비정상 종료되었습니다 (exit=$SCAN_EXIT)." >&2
++    exit "$SCAN_EXIT"
++fi
++
++echo "[run_scan.sh] 스캔 완료 (exit=$SCAN_EXIT)" >&2
+diff --git a/socode/scripts/run_tests.sh b/socode/scripts/run_tests.sh
+new file mode 100755
+index 0000000..9daafd5
+--- /dev/null
++++ b/socode/scripts/run_tests.sh
+@@ -0,0 +1,24 @@
++#!/usr/bin/env bash
++# 수정 후 기존 테스트 스위트를 실행해 회귀 여부를 확인한다.
++# 프로젝트 종류에 따라 자동 감지해서 적절한 커맨드를 실행한다.
++# 필요시 TODO 부분을 프로젝트에 맞게 조정하세요.
++set -euo pipefail
++
++echo "[run_tests.sh] 테스트 실행 중..." >&2
++
++if [ -f "pom.xml" ]; then
++    mvn -q test
++elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
++    ./gradlew test
++elif [ -f "package.json" ]; then
++    npm test
++elif [ -f "pytest.ini" ] || [ -f "pyproject.toml" ] || ls tests/ >/dev/null 2>&1; then
++    python3 -m pytest
++else
++    echo "[run_tests.sh][WARN] 테스트 러너를 자동으로 판별하지 못했습니다." >&2
++    echo "[run_tests.sh][WARN] 이 스크립트의 TODO 부분에 프로젝트 테스트 커맨드를 직접 추가하세요." >&2
++    # TODO: 프로젝트 전용 테스트 커맨드 추가
++    exit 1
++fi
++
++echo "[run_tests.sh] 테스트 통과" >&2
+-- 
+2.43.0
+

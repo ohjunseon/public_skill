@@ -1,0 +1,10 @@
+sqlalchemy>=2.0
+pyyaml>=6.0
+python-dotenv>=1.0
+mcp>=2.0            # MCP 서버 실행용 (mcp_server.py)
+
+# 아래는 실제 연결할 DB에 맞춰 필요한 것만 주석 해제하세요
+oracledb>=2.0        # Oracle
+psycopg2-binary>=2.9 # PostgreSQL
+pymysql>=1.1         # MySQL / MariaDB
+pyodbc>=5.0          # MSSQL (+ ODBC Driver 17 for SQL Server 시스템 설치 필요)
